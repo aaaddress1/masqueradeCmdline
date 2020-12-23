@@ -12,7 +12,6 @@
 #include <stdio.h>
 #include <windows.h>
 #include <winternl.h>
-
 typedef struct _PEB32 {
 	UCHAR InheritedAddressSpace;     // +00
 	UCHAR ReadImageFileExecOptions;  // +01
@@ -20,8 +19,8 @@ typedef struct _PEB32 {
 	UCHAR BitField;                  // +03
 	ULONG Mutant;                    // +04
 	ULONG ImageBaseAddress;          // +08
-	ULONG useless;
-	ULONG ProcessParameters;         // +0c
+	_PEB_LDR_DATA * Ldr;             // +0c
+	ULONG ProcessParameters;         // +10
 	ULONG SubSystemData;
 	ULONG ProcessHeap;
 	ULONG FastPebLock;
